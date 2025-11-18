@@ -630,7 +630,7 @@ def index():
             matches_do_pai = parse_parent_segment_files(seg_files_pai)
             matches_da_mae = parse_parent_segment_files(seg_files_mae)
 
-            # --- ETAPA 6A: Seeds ---
+            # --- ETAPA 6A: Seeds (Com Lógica Dedutiva) ---
             initial_groups = {
                 "paternal": set(),
                 "maternal": set(),
@@ -641,19 +641,32 @@ def index():
             for nn_key in kept.keys():
                 in_pai = nn_key in matches_do_pai
                 in_mae = nn_key in matches_da_mae
+                
+                # 1. Match está nos dois arquivos (parente de ambos ou endogamia)
                 if in_pai and in_mae:
                     initial_groups["both"].add(nn_key)
+                
+                # 2. Match está confirmado no arquivo do Pai
                 elif in_pai:
                     initial_groups["paternal"].add(nn_key)
+                
+                # 3. Match está confirmado no arquivo da Mãe
                 elif in_mae:
                     initial_groups["maternal"].add(nn_key)
+                
+                # 4. Match não está em nenhum arquivo enviado... Vamos deduzir?
                 else:
-                    initial_groups["unknown"].add(nn_key)
-
-            print(f"[INFO] Phasing (Inicial): {len(initial_groups['paternal'])} Pat / "
-                  f"{len(initial_groups['maternal'])} Mat / "
-                  f"{len(initial_groups['both'])} Ambos / "
-                  f"{len(initial_groups['unknown'])} Desconhecidos")
+                    # Se enviou SÓ o arquivo do Pai, e o match NÃO está nele -> É Materno
+                    if has_pai and not has_mae:
+                         initial_groups["maternal"].add(nn_key)
+                    
+                    # Se enviou SÓ o arquivo da Mãe, e o match NÃO está nele -> É Paterno
+                    elif has_mae and not has_pai:
+                         initial_groups["paternal"].add(nn_key)
+                    
+                    # Se tem os dois arquivos (ou nenhum) e não achou -> É Desconhecido mesmo
+                    else:
+                        initial_groups["unknown"].add(nn_key)
 
             # --- ETAPA 6B: Phasing Final ---
             phased_groups = {
