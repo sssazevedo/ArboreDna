@@ -497,8 +497,13 @@ def index():
         if not seg_files_user or seg_files_user[0].filename == "":
             return render_template("index.html", error="Envie ao menos 1 CSV de segmentos do Usuário.")
         
-        is_phased = (seg_files_pai and seg_files_pai[0].filename != "") and \
-                    (seg_files_mae and seg_files_mae[0].filename != "")
+        # ===============================
+        # CORREÇÃO: Ativar Phasing se PELO MENOS UM dos pais for enviado
+        # ===============================
+        has_pai = (seg_files_pai and seg_files_pai[0].filename != "")
+        has_mae = (seg_files_mae and seg_files_mae[0].filename != "")
+        
+        is_phased = has_pai or has_mae
                     
         # --- NOVO: Capturar Resolução do Formulário ---
         try:
