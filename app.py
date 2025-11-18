@@ -44,35 +44,88 @@ def norm_name(s: str) -> str:
 # PARSE DE SEGMENTOS (PARA USUÁRIO E PAIS)
 # ------------------------------------------------------------
 def parse_segments_csv(path):
+    """
+    Lê o CSV de segmentos de forma otimizada para memória.
+    1. Lê apenas o cabeçalho para identificar as colunas.
+    2. Carrega apenas as colunas necessárias (Name, Chr, Start, End, cM).
+    3. Retorna erro explicativo se o formato estiver errado.
+    """
+    # ETAPA 1: Ler apenas o cabeçalho para mapear colunas (sem carregar dados)
     try:
-        df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True)
+        header_df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True, nrows=0)
     except:
-        df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True)
-    df.columns = [c.strip() for c in df.columns]
-    name_col = next((c for c in df.columns if c.lower() in ("name","matchedname","match","kit","match name")), None)
-    chr_col  = next((c for c in df.columns if c.lower() in ("chr","chrom","chromosome")), None)
-    s_col    = next((c for c in df.columns if c.lower() in ("start","startpos","start position","b37start")), None)
-    e_col    = next((c for c in df.columns if c.lower() in ("end","endpos","end position","b37end")), None)
-    cm_col   = next((c for c in df.columns if "cm" in c.lower()), None)
-    if not (name_col and chr_col and s_col and e_col and cm_col):
-        raise ValueError("Arquivo de segmentos inválido.")
+        try:
+            header_df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True, nrows=0)
+        except Exception as e:
+            raise ValueError(f"Não foi possível ler o arquivo. Verifique a codificação ou se é um CSV válido. Detalhes: {e}")
+
+    cols = [c.strip() for c in header_df.columns]
+    
+    # Mapeamento flexível de colunas (MyHeritage, FTDNA, 23andMe, GEDmatch, etc)
+    col_map = {}
+    for c in cols:
+        cl = c.lower()
+        if cl in ("name", "matchedname", "match", "kit", "match name"):
+            col_map["name"] = c
+        elif cl in ("chr", "chrom", "chromosome"):
+            col_map["chr"] = c
+        elif cl in ("start", "startpos", "start position", "b37start"):
+            col_map["start"] = c
+        elif cl in ("end", "endpos", "end position", "b37end"):
+            col_map["end"] = c
+        elif "cm" in cl and "segment" in cl: # Ex: "Segment cM"
+             col_map["cm"] = c
+        elif "cm" in cl and "centimorgan" in cl:
+             col_map["cm"] = c
+        elif cl == "cm": # Às vezes é apenas 'cm'
+             col_map["cm"] = c
+
+    # Validação: Se faltar alguma coluna essencial, para tudo.
+    required = ["name", "chr", "start", "end", "cm"]
+    if not all(k in col_map for k in required):
+        missing = [k for k in required if k not in col_map]
+        raise ValueError(f"Colunas obrigatórias ausentes: {', '.join(missing)}. Verifique se o arquivo é de segmentos de DNA.")
+
+    relevant_cols = list(col_map.values())
+
+    # ETAPA 2: Carregar os dados, mas APENAS as colunas úteis (Economia de RAM)
+    try:
+        df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True, usecols=relevant_cols)
+    except:
+        df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True, usecols=relevant_cols)
+
+    # Renomear para padronizar o processamento abaixo
+    df = df.rename(columns={
+        col_map["name"]: "name_col",
+        col_map["chr"]: "chr_col",
+        col_map["start"]: "s_col",
+        col_map["end"]: "e_col",
+        col_map["cm"]: "cm_col"
+    })
+
+    # ETAPA 3: Processar linhas
     segs_by = {}
     for _, r in df.iterrows():
-        nm = r.get(name_col, "")
+        nm = r["name_col"]
         if pd.isna(nm): continue
         nm = str(nm).strip()
         if nm == "": continue
+        
         try:
-            chr_val = str(r[chr_col]).strip().upper()
+            chr_val = str(r["chr_col"]).strip().upper()
             chrn = int(chr_val.replace("X", "23"))
-        except: continue
+        except: continue # Pula erros de conversão de cromossomo
+        
         try:
-            s = int(float(r[s_col]))
-            e = int(float(r[e_col]))
-            cm = float(r[cm_col])
-        except: continue
+            s = int(float(r["s_col"]))
+            e = int(float(r["e_col"]))
+            cm = float(r["cm_col"])
+        except: continue # Pula erros de conversão numérica
+        
         if cm < 7: continue
+        
         segs_by.setdefault(nm, []).append({"chr": chrn, "start": s, "end": e, "cm": cm})
+        
     return segs_by
 
 def parse_parent_segment_files(file_list):
@@ -96,33 +149,89 @@ def parse_parent_segment_files(file_list):
 # PARSE DE TRIANGULAÇÃO (COM PESOS)
 # ------------------------------------------------------------
 def parse_triang_csv(path):
+    """
+    Lê o CSV de triangulação de forma otimizada para memória.
+    1. Lê apenas o cabeçalho para identificar as colunas.
+    2. Carrega apenas as colunas necessárias (Match A, Match B, Chr, cM).
+    3. Retorna erro explicativo se o formato estiver errado.
+    """
+    # ETAPA 1: Ler apenas o cabeçalho para mapear colunas
     try:
-        df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True)
+        header_df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True, nrows=0)
     except:
-        df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True)
-    df.columns = [c.strip() for c in df.columns]
-    a_col = next((c for c in df.columns if any(k in c.lower() for k in ("match a","match1","name a","person a","kit1 name"))), None)
-    b_col = next((c for c in df.columns if any(k in c.lower() for k in ("match b","match2","name b","person b","kit2 name"))), None)
-    chr_col = next((c for c in df.columns if c.lower() in ("chr","chrom","chromosome")), None)
-    cm_col   = next((c for c in df.columns if "cm" in c.lower()), None)
-    if not (a_col and b_col and chr_col and cm_col):
-        print("[AVISO] Colunas de Triangulação (A, B, Chr, cM) não encontradas. Pulando arquivo.")
-        return {}
+        try:
+            header_df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True, nrows=0)
+        except Exception as e:
+            raise ValueError(f"Não foi possível ler o arquivo. Verifique a codificação. Detalhes: {e}")
+
+    cols = [c.strip() for c in header_df.columns]
+    
+    # Mapeamento flexível de colunas
+    col_map = {}
+    for c in cols:
+        cl = c.lower()
+        # Identificar Match A / Kit 1
+        if any(k in cl for k in ("match a", "match1", "name a", "person a", "kit1 name")):
+            col_map["a"] = c
+        # Identificar Match B / Kit 2
+        elif any(k in cl for k in ("match b", "match2", "name b", "person b", "kit2 name")):
+            col_map["b"] = c
+        # Chromosome
+        elif cl in ("chr", "chrom", "chromosome"):
+            col_map["chr"] = c
+        # cM
+        elif "cm" in cl: 
+             col_map["cm"] = c
+
+    # Validação: Se faltar colunas essenciais, aborta.
+    required = ["a", "b", "chr", "cm"]
+    if not all(k in col_map for k in required):
+        missing = [k for k in required if k not in col_map]
+        raise ValueError(f"Colunas de Triangulação obrigatórias ausentes: {', '.join(missing)}. Verifique se é um arquivo de triangulação válido (GEDmatch, etc).")
+
+    relevant_cols = list(col_map.values())
+
+    # ETAPA 2: Carregar AGORA sim os dados, mas APENAS as colunas úteis (Economia de RAM)
+    try:
+        df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True, usecols=relevant_cols)
+    except:
+        df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True, usecols=relevant_cols)
+
+    # Renomear para padronizar
+    df = df.rename(columns={
+        col_map["a"]: "a_col",
+        col_map["b"]: "b_col",
+        col_map["chr"]: "chr_col",
+        col_map["cm"]: "cm_col"
+    })
+
+    # ETAPA 3: Processar linhas
     tri_with_cm = {}
     for _, r in df.iterrows():
-        a = norm_name(str(r[a_col]))
-        b = norm_name(str(r[b_col]))
+        # Normalizar nomes usando sua função 'norm_name'
+        a = norm_name(str(r["a_col"]))
+        b = norm_name(str(r["b_col"]))
+        
+        # Validação e Conversão
         try:
-            chr_val = str(r[chr_col]).strip().upper()
+            chr_val = str(r["chr_col"]).strip().upper()
             chrn = int(chr_val.replace("X", "23"))
         except: continue
+        
         try:
-            cm = float(r[cm_col])
+            cm = float(r["cm_col"])
         except: cm = 0.0
+        
+        # Filtrar ruído
         if not a or not b or a == b or cm < 7.0: continue
+        
+        # Garantir ordem alfabética para chave única (A-B é igual a B-A)
         if a > b: a, b = b, a
+        
         tkey = (a, b, chrn)
+        # Armazena o maior cM encontrado para esse par naquele cromossomo
         tri_with_cm[tkey] = max(tri_with_cm.get(tkey, 0.0), cm)
+
     print(f"[DEBUG] 'parse_triang_csv' finalizou. Pares ponderados lidos: {len(tri_with_cm)}")
     return tri_with_cm
 
@@ -401,19 +510,31 @@ def index():
         # ------------------------------------------------
 
         # ===============================
-        # 2) PARSEAR SEGMENTOS DO USUÁRIO
+        # 2) PARSEAR SEGMENTOS DO USUÁRIO (COM PROTEÇÃO)
         # ===============================
         raw_segs = {}
         for f in seg_files_user:
             if f.filename == "": continue
             p = os.path.join(UPLOAD_FOLDER, f.filename)
             f.save(p)
-            parsed = parse_segments_csv(p)
+            
+            try:
+                parsed = parse_segments_csv(p)
+                if not parsed:
+                    # Se o arquivo foi lido mas não gerou nenhum segmento válido
+                    raise ValueError("Arquivo lido, mas nenhum segmento válido (>7cM) encontrado.")
+                    
+            except Exception as e:
+                # Captura o erro e mostra na tela vermelha para o usuário
+                print(f"[ERRO] Falha ao processar {f.filename}: {e}")
+                return render_template("index.html", error=f"Erro no arquivo '{f.filename}': {str(e)}")
+            
+            # Se deu tudo certo, adiciona aos segmentos brutos
             for name, segs in parsed.items():
                 raw_segs.setdefault(name, []).extend(segs)
 
         # ===============================
-        # 3) PARSEAR TRIANGULAÇÃO (SEMPRE NECESSÁRIO)
+        # 3) PARSEAR TRIANGULAÇÃO (COM PROTEÇÃO DE ERRO)
         # ===============================
         all_tri = {}
         if tri_files and tri_files[0].filename != "":
@@ -421,7 +542,17 @@ def index():
                 if f.filename == "": continue
                 p = os.path.join(UPLOAD_FOLDER, f.filename)
                 f.save(p)
-                parsed_tri = parse_triang_csv(p)
+                
+                # --- BLINDAGEM DE ERRO ---
+                try:
+                    parsed_tri = parse_triang_csv(p)
+                    # O parse_triang_csv original retorna {} se falhar silenciosamente, 
+                    # mas se der erro de leitura (UTF-8, formato), vai cair no except abaixo.
+                except Exception as e:
+                    print(f"[ERRO] Falha na triangulação {f.filename}: {e}")
+                    return render_template("index.html", error=f"Erro ao ler o arquivo de triangulação '{f.filename}': {str(e)}")
+                # -------------------------
+
                 all_tri.update(parsed_tri)
                 
         tem_triangulacao = len(all_tri) > 0
