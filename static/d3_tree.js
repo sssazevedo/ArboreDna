@@ -58,7 +58,7 @@
     // ---------------------------------------------
     const treeLayout = d3
         .tree()
-        .nodeSize([90, 140]); // espaçamento horizontal (x) e vertical (y)
+        .nodeSize([60, 160]); // espaçamento horizontal (x) e vertical (y)
 
     root.x0 = width / 2;
     root.y0 = 0;
