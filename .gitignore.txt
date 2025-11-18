@@ -1,13 +1,17 @@
-# Ambiente Virtual
+# Ignorar ambiente virtual
 venv/
+env/
 
-# Arquivos temporários do Python
+# Ignorar arquivos compilados do Python
 __pycache__/
 *.pyc
 
-# Pastas de upload e de grafos gerados
+# Ignorar dados sensíveis e uploads (IMPORTANTE PARA DNA)
 uploads/
-static/graph_*.html
 
-# Arquivos de IDE
+# Ignorar pasta de arquivos de teste
+ArquivosEntrada/
+
+# Ignorar configurações do sistema/editor
+.DS_Store
 .vscode/

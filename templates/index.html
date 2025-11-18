@@ -3,198 +3,157 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Analisador de Conexões Genealógicas</title>
+    <title>ArboreDNA - Construtor de Hipótese de Árvore</title>
+
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+
     <style>
-        body { background-color: #f8f9fa; }
-        .card { margin-top: 1.5rem; }
-        .nav-tabs { margin-bottom: 1.5rem; }
-        .spinner-border { width: 3rem; height: 3rem; }
-        .graph-container {
-            border: 1px solid #dee2e6;
-            border-radius: .375rem;
-            padding: 1rem;
-            background-color: #fafafa;
-            overflow-x: auto;
+        body { 
+            background-color: #f2f4f7; 
         }
-        .mermaid {
-            text-align: center;
+        .card {
+            margin-top: 2rem;
+            border-radius: 0.75rem;
+        }
+        .main-title {
+            font-size: 2rem;
+            font-weight: 700;
+        }
+        .subtitle {
+            font-size: 1rem;
+        }
+        .spinner-border { 
+            width: 3rem; 
+            height: 3rem; 
+        }
+        #loading p {
+            color: #555;
+        }
+        .info-box {
+            background: #eef3ff;
+            border-left: 4px solid #4a6cff;
+            padding: 12px 16px;
+            border-radius: 6px;
+            margin-bottom: 1rem;
+            font-size: 0.95rem;
+        }
+        .info-box-phased {
+            background: #e6f7eb; /* Verde */
+            border-left-color: #34c759;
         }
     </style>
 </head>
+
 <body>
     <div class="container my-5">
         <div class="row justify-content-center">
-            <div class="col-lg-10">
-                <div class="card shadow-sm main-card">
+            <div class="col-lg-7">
+
+                <div class="card shadow-sm">
                     <div class="card-body">
-                        <h1 class="card-title text-center mb-4">Analisador Genealógico e de DNA</h1>
 
-                        {% if message %}
-                            <div class="alert alert-{{ 'success' if success else 'danger' }} alert-dismissible fade show" role="alert">
-                                {{ message }}
-                                <button type="button" class="btn-close" data-bs-dismiss="alert" aria-label="Close"></button>
-                            </div>
-                        {% endif %}
+                        <h1 class="main-title text-center mb-2">🧬 ArboreDNA</h1>
+                        <p class="subtitle text-center text-muted mb-4">
+                            Construtor automático de hipótese de árvore genealógica com base em compartilhamentos e triangulações de DNA.
+                        </p>
 
-                        {% if not gedcom_filename %}
-                            <p class="text-center text-muted">Para começar, carregue a sua árvore genealógica em formato GEDCOM.</p>
-                            <form method="POST" enctype="multipart/form-data" id="gedcom-upload-form">
-                                <input type="hidden" name="action" value="upload_gedcom">
-                                <div class="mb-3">
-                                    <label for="gedcom" class="form-label"><b>Arquivo GEDCOM</b></label>
-                                    <input class="form-control" type="file" id="gedcom" name="gedcom" required>
-                                </div>
-                                <div class="d-grid">
-                                    <button type="submit" class="btn btn-primary btn-lg">Carregar e Analisar</button>
-                                </div>
-                            </form>
-                        {% else %}
-                            <ul class="nav nav-tabs" id="analysisTabs" role="tablist">
-                                <li class="nav-item" role="presentation">
-                                    <button class="nav-link active" id="path-tab" data-bs-toggle="tab" data-bs-target="#path-panel" type="button" role="tab">Buscar Conexão no GEDCOM</button>
-                                </li>
-                                <li class="nav-item" role="presentation">
-                                    <button class="nav-link" id="dna-tab" data-bs-toggle="tab" data-bs-target="#dna-panel" type="button" role="tab">Analisador de DNA</button>
-                                </li>
-                            </ul>
-
-                            <div class="tab-content" id="analysisTabsContent">
-                                <div class="tab-pane fade show active" id="path-panel" role="tabpanel">
-                                    <p class="text-muted">Escolha duas pessoas do arquivo GEDCOM carregado para encontrar o caminho genealógico entre elas.</p>
-                                    <form method="POST" id="path-form">
-                                        <input type="hidden" name="action" value="path_search">
-                                        <input type="hidden" name="gedcom_filename" value="{{ gedcom_filename }}">
-                                        <div class="mb-3">
-                                            <label for="person1_name" class="form-label"><b>Pessoa 1</b></label>
-                                            <input type="text" class="form-control" id="person1_name" name="person1_name" required list="gedcom_names" placeholder="Comece a digitar um nome...">
-                                        </div>
-                                        <div class="mb-3">
-                                            <label for="person2_name" class="form-label"><b>Pessoa 2</b></label>
-                                            <input type="text" class="form-control" id="person2_name" name="person2_name" required list="gedcom_names" placeholder="Comece a digitar um nome...">
-                                        </div>
-                                        <div class="d-grid">
-                                            <button type="submit" class="btn btn-info">Encontrar Conexão</button>
-                                        </div>
-                                    </form>
-                                </div>
-
-                                <div class="tab-pane fade" id="dna-panel" role="tabpanel">
-                                    <p class="text-muted">Carregue sua lista de matches (CSV) e insira o seu nome para encontrar as conexões confirmadas por DNA.</p>
-                                    <form method="POST" enctype="multipart/form-data" id="dna-form">
-                                        <input type="hidden" name="action" value="dna_analysis">
-                                        <input type="hidden" name="gedcom_filename" value="{{ gedcom_filename }}">
-                                        <div class="mb-3">
-                                            <label for="matches_csv" class="form-label"><b>1. Lista de Matches (CSV)</b></label>
-                                            <input class="form-control" type="file" id="matches_csv" name="matches_csv" required>
-                                        </div>
-                                        <div class="mb-3">
-                                            <label for="root_name" class="form-label"><b>2. Seu Nome (como está no GEDCOM)</b></label>
-                                            <input type="text" class="form-control" id="root_name" name="root_name" placeholder="Ex: João da Silva" required list="gedcom_names">
-                                        </div>
-                                        <div class="d-grid">
-                                            <button type="submit" class="btn btn-success">Analisar Matches de DNA</button>
-                                        </div>
-                                    </form>
-                                </div>
-                            </div>
-                            <datalist id="gedcom_names">
-                                {% for name in all_names %}
-                                    <option value="{{ name }}">
-                                {% endfor %}
-                            </datalist>
-                        {% endif %}
-
-                        <div id="loading" class="text-center mt-4" style="display: none;">
-                            <div class="spinner-border text-primary" role="status"><span class="visually-hidden">Analisando...</span></div>
-                            <p class="mt-2">Analisando... Isso pode levar alguns segundos.</p>
+                        <div class="info-box">
+                            Gere uma árvore hipotética mostrando como seus matches estão agrupados em 
+                            <strong>clusters (sub-ramos)</strong> familiares.
+                            Quanto mais arquivos de <strong>triangulação</strong> você enviar, mais precisa fica a análise.
                         </div>
+                        
+                        <div class="info-box info-box-phased">
+                            <strong>Modo Phased:</strong> Se você enviar os arquivos de segmento de seus pais, o sistema irá classificar seus matches em <strong>Paterno</strong>, <strong>Materno</strong> e <strong>Ambos</strong>.
+                        </div>
+
+                        {% if error %}
+                            <div class="alert alert-danger" role="alert">
+                                {{ error }}
+                            </div>
+                        {% endif %}
+
+                        <form method="POST" enctype="multipart/form-data" id="dna-form">
+
+                            <div class="mb-3">
+                                <label for="segment_files" class="form-label fw-bold">
+                                    1. Seus Arquivos de Segmento (CSV) — obrigatório
+                                </label>
+                                <input class="form-control" type="file" id="segment_files" name="segment_files" multiple required>
+                                <div class="form-text">
+                                    Envie <strong>apenas</strong> os arquivos de segmento da pessoa principal (Você).
+                                </div>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="father_segment_files" class="form-label fw-bold">
+                                    2. Segmentos do Pai (CSV) — opcional
+                                </label>
+                                <input class="form-control" type="file" id="father_segment_files" name="father_segment_files" multiple>
+                                <div class="form-text">
+                                    Envie os arquivos de segmento do seu <strong>Pai</strong> para ativar o Modo Phased.
+                                </div>
+                            </div>
+                            
+                            <div class="mb-3">
+                                <label for="mother_segment_files" class="form-label fw-bold">
+                                    3. Segmentos da Mãe (CSV) — opcional
+                                </label>
+                                <input class="form-control" type="file" id="mother_segment_files" name="mother_segment_files" multiple>
+                                <div class="form-text">
+                                    Envie os arquivos de segmento da sua <strong>Mãe</strong> para ativar o Modo Phased.
+                                </div>
+                            </div>
+                            <div class="mb-3">
+                                <label for="triangulation_csv" class="form-label fw-bold">
+                                    4. Arquivos de Triangulação (CSV) — opcional
+                                </label>
+                                <input class="form-control" type="file" id="triangulation_csv" name="triangulation_csv" multiple>
+                                <div class="form-text">
+                                    Envie todos os arquivos de triangulação que possuir: <strong>seus e também os de seus matches</strong>.
+                                </div>
+                            </div>
+							<div class="mb-3">
+								<label for="resolution_select" class="form-label fw-bold">
+									5. Resolução dos Clusters (Sensibilidade)
+								</label>
+								<select name="resolution_select" id="resolution_select" class="form-control">
+									<option value="0.5">Grupos Maiores (Unir clusters)</option>
+									<option value="1.0" selected>Equilibrado (Padrão)</option>
+									<option value="1.5">Grupos Menores (Dividir clusters)</option>
+								</select>
+								<div class="form-text">
+									Valores baixos (0.5) forçam a união de clusters. Valores altos (1.5) criam mais divisões.
+								</div>
+							</div>
+                            <div class="d-grid mt-4">
+                                <button type="submit" class="btn btn-primary btn-lg">
+                                    Construir Hipótese da Árvore
+                                </button>
+                            </div>
+
+                        </form>
                     </div>
                 </div>
 
-                <div id="results-area">
-                    {% if dna_results %}
-                        <h2 class="text-center mt-5">Resultados da Análise de DNA</h2>
-                        {% for result in dna_results %}
-                            <div class="card">
-                                <div class="card-header"><h5>Conexão com: <strong>{{ result.match_name }}</strong> <span class="badge bg-success">{{ result.cm }} cM</span></h5></div>
-                                <div class="card-body">
-                                    <p><strong>Caminho:</strong> {{ result.text_path }}</p>
-                                    <p class="mb-2"><strong>Relacionamento Provável (DNA):</strong> <span class="text-primary">{{ result.relationships }}</span></p>
-                                    <div class="graph-container"><div class="mermaid">{{ result.mermaid_data | safe }}</div></div>
-                                </div>
-                            </div>
-                        {% endfor %}
-                    {% endif %}
-					
-					{% if skipped_matches %}
-					  <h2 class="text-center mt-5">Matches descartados ({{ skipped_matches | length }})</h2>
-
-					  <div class="card">
-						<div class="card-body">
-						  <p class="text-muted">
-							Estes nomes estavam no CSV, mas foram rejeitados pelas regras de validação. O motivo aparece abaixo.
-						  </p>
-
-						  <div class="table-responsive">
-							<table class="table table-sm align-middle">
-							  <thead>
-								<tr>
-								  <th style="width:45%">Nome no CSV</th>
-								  <th>Motivo</th>
-								</tr>
-							  </thead>
-							  <tbody>
-								{% for item in skipped_matches %}
-								  <tr>
-									<td><strong>{{ item.csv_name }}</strong></td>
-									<td>{{ item.motivo }}</td>
-								  </tr>
-								{% endfor %}
-							  </tbody>
-							</table>
-						  </div>
-						 
-						</div>
-					  </div>
-					{% endif %}
-
-
-                    {% if path_result %}
-                        <h2 class="text-center mt-5">Resultado da Busca de Conexão</h2>
-                        <div class="card">
-                            <div class="card-header"><h5>Conexão entre: <strong>{{ path_result.person1_name }}</strong> e <strong>{{ path_result.person2_name }}</strong></h5></div>
-                            <div class="card-body">
-                                <p><strong>Caminho:</strong> {{ path_result.text_path }}</p>
-                                <div class="graph-container"><div class="mermaid">{{ path_result.mermaid_data | safe }}</div></div>
-                            </div>
-                        </div>
-                    {% endif %}
+                <div id="loading" class="text-center mt-4" style="display: none;">
+                    <div class="spinner-border text-primary" role="status">
+                        <span class="visually-hidden">Carregando...</span>
+                    </div>
+                    <p class="mt-3">Carregando dados de DNA e montando árvore hipotética…<br>Isso leva alguns segundos.</p>
                 </div>
+
             </div>
         </div>
     </div>
 
-    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
     <script>
-        document.addEventListener('DOMContentLoaded', function () {
-            mermaid.initialize({ startOnLoad: false, securityLevel: 'loose' });
-            setTimeout(() => {
-                const mermaidElements = document.querySelectorAll(".mermaid");
-                if (mermaidElements.length) {
-                    mermaid.run({ nodes: mermaidElements });
-                }
-            }, 100);
-        });
-
-        document.querySelectorAll('form').forEach(form => {
-            form.addEventListener('submit', function() {
-                document.getElementById('loading').style.display = 'block';
-                document.getElementById('results-area').style.display = 'none';
-            });
+        document.getElementById('dna-form').addEventListener('submit', function() {
+            document.getElementById('loading').style.display = 'block';
+            const btn = this.querySelector('button[type="submit"]');
+            btn.disabled = true;
+            btn.innerText = 'Processando...';
         });
     </script>
-	
 </body>
 </html>

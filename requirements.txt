@@ -1,9 +1,4 @@
 Flask
-ged4py
-networkx
-matplotlib
 pandas
-python-Levenshtein
-thefuzz
-pyvis
-gunicorn 
+networkx
+gunicorn

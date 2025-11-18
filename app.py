@@ -1,887 +1,622 @@
 import os
 import re
-from flask import Flask, render_template, request
-from ged4py.parser import GedcomReader
-from thefuzz import fuzz
+import unicodedata
+import string
 import pandas as pd
-import unicodedata, string
 import networkx as nx
 from collections import deque
+from flask import Flask, render_template, request
+import json
+from networkx.algorithms.community import greedy_modularity_communities
 
-# --- Configuração ---
+# ------------------------------------------------------------
+# CONFIGURAÇÕES DO FLASK
+# ------------------------------------------------------------
 app = Flask(__name__)
-app.secret_key = 'f@milyse@rch_dna_edition_v16'
-
+app.secret_key = 'arbore_dna_v1'
 UPLOAD_FOLDER = "uploads"
-STATIC_FOLDER = "static"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-os.makedirs(STATIC_FOLDER, exist_ok=True)
 
-people = {}
-families = {}
-graph = None
-child_to_family = {}  # índice filho -> [famílias onde é CHIL]
-
-# --- Faixas cM (ampliadas) ---
-SHARED_CM_DATA = [
-    {"range": (3300, 3720), "relationship": "Pai/Mãe ↔ Filho(a)"},
-    {"range": (2200, 3400), "relationship": "Irmãos completos"},
-    {"range": (1317, 2312), "relationship": "Avós/Netos, Tios/Tias ↔ Sobrinhos(as), Meios-irmãos"},
-    {"range": (553, 1330), "relationship": "Primos de 1º grau"},
-    {"range": (200, 850), "relationship": "Primos de 1º grau (1× removido), Meios-primos, Tios-avós ↔ Sobrinhos-netos"},
-    {"range": (46, 515), "relationship": "Primos de 2º grau"},
-    {"range": (30, 350), "relationship": "Primos de 2º grau (1× removido), Primos de 3º grau"},
-    {"range": (10, 220), "relationship": "Primos de 3º grau (1× removido), Primos de 4º grau"},
-    {"range": (0, 110), "relationship": "Primos de 4º/5º grau ou mais distantes"},
-]
-
-# ---------- Helpers ----------
-def ref_id(val):
-    return getattr(val, 'xref_id', val)
-
-def get_name(person):
-    return person.name.format() if person and person.name else "Sem Nome"
-
-STOP_WORDS = {"de","da","do","das","dos","e"}
-GENERIC_GIVENS = {"maria","jose","josé","joao","joão","ana","luiz","luís","francisco",
-                  "antonio","antônio","fernando","carlos","paulo","pedro","marcos", 
-                  "augusto", "sergio", "sérgio", "helena"}
-SURNAME_SUFFIXES = {"filho", "neto", "junior", "júnior", "sobrinho"}
-COMMON_SURNAMES = {
-    "silva","oliveira","santos","souza","souza","pereira","ferreira","almeida",
-    "costa","rodrigues","lima","gomes","ribeiro","carvalho","azevedo","albuquerque",
-}
-
-SURNAME_EQUIV = {
-    "netto": "neto",
-    "gouvea": "gouveia",
-    "gouvêa": "gouveia",
-    "gouvéia": "gouveia",
-}
-
-def strip_bad_utf(s: str) -> str:
-    if s is None: return ""
-    s = str(s)
-
-    # Correções mais comuns de mojibake (Latin-1 lido como UTF-8)
-    fixes = {
-        "A�": "ç", "Ã§": "ç",
-        "Ã£": "ã", "Ã¡": "á", "Ã¢": "â",
-        "Ã©": "é", "Ãª": "ê", "Ã¨": "è",
-        "Ã­": "í", "Ã³": "ó", "Ã´": "ô", "Ãº": "ú",
-        "Ã": "Ã",  
-        "GouvA�": "Gouvê",   
-        "A�": "ç",           
-        "JoA�o": "João", "SA�": "Sá", "GonA�": "Gonç",
-    }
-    for bad, good in fixes.items():
-        s = s.replace(bad, good)
-
-    # Remove demais lixos não alfanuméricos (mantém letras acentuadas e ' )
-    return re.sub(r"[^\w\sÁ-ú'-]", " ", s)
-
+# ------------------------------------------------------------
+# FUNÇÕES DE NORMALIZAÇÃO
+# ------------------------------------------------------------
 def norm_name(s: str) -> str:
-    s = strip_bad_utf(str(s))
+    if s is None:
+        return ""
+    s = str(s).strip().replace("\n", " ").replace("\r", " ")
+    s = "".join(ch for ch in s if ch.isprintable())
+    if s == "":
+        return ""
+    original = s
+    s = unicodedata.normalize("NFKC", s)
+    s = re.sub(r"[^0-9A-Za-zÁ-ú' -]", " ", s)
+    s = " ".join(s.split())
+    parts = s.split()
+    if len(parts) == 1:
+        return parts[0].lower()
     s = unicodedata.normalize("NFKD", s)
-    s = "".join(ch for ch in s if not unicodedata.combining(ch))
-    s = s.replace("/", " ")
-    s = "".join(ch if ch not in set(string.punctuation) else " " for ch in s)
-    s = " ".join(s.lower().split())
+    s = "".join(c for c in s if not unicodedata.combining(c))
+    s = "".join(ch if (ch.isalnum() or ch in " -'") else " " for ch in s)
+    s = " ".join(s.split()).lower()
     return s
 
-SHORT_KEEP = {"sa", "sá"}  # sobrenome real na sua base
+# ------------------------------------------------------------
+# PARSE DE SEGMENTOS (PARA USUÁRIO E PAIS)
+# ------------------------------------------------------------
+def parse_segments_csv(path):
+    try:
+        df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True)
+    except:
+        df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True)
+    df.columns = [c.strip() for c in df.columns]
+    name_col = next((c for c in df.columns if c.lower() in ("name","matchedname","match","kit","match name")), None)
+    chr_col  = next((c for c in df.columns if c.lower() in ("chr","chrom","chromosome")), None)
+    s_col    = next((c for c in df.columns if c.lower() in ("start","startpos","start position","b37start")), None)
+    e_col    = next((c for c in df.columns if c.lower() in ("end","endpos","end position","b37end")), None)
+    cm_col   = next((c for c in df.columns if "cm" in c.lower()), None)
+    if not (name_col and chr_col and s_col and e_col and cm_col):
+        raise ValueError("Arquivo de segmentos inválido.")
+    segs_by = {}
+    for _, r in df.iterrows():
+        nm = r.get(name_col, "")
+        if pd.isna(nm): continue
+        nm = str(nm).strip()
+        if nm == "": continue
+        try:
+            chr_val = str(r[chr_col]).strip().upper()
+            chrn = int(chr_val.replace("X", "23"))
+        except: continue
+        try:
+            s = int(float(r[s_col]))
+            e = int(float(r[e_col]))
+            cm = float(r[cm_col])
+        except: continue
+        if cm < 7: continue
+        segs_by.setdefault(nm, []).append({"chr": chrn, "start": s, "end": e, "cm": cm})
+    return segs_by
 
-def drop_short_tokens(S, n=3):
-    return {t for t in S if len(t) >= n or t in SHORT_KEEP}
+def parse_parent_segment_files(file_list):
+    """Parses segment files and returns a simple set of normalized match names."""
+    names_set = set()
+    for f in file_list:
+        if f.filename == "": continue
+        p = os.path.join(UPLOAD_FOLDER, f.filename)
+        f.save(p)
+        try:
+            parsed = parse_segments_csv(p)
+            for name in parsed.keys():
+                nn = norm_name(name)
+                if nn:
+                    names_set.add(nn)
+        except Exception as e:
+            print(f"[AVISO] Falha ao ler arquivo de segmento do pai/mãe: {e}")
+    return names_set
 
-def surname_core_tokens(name: str, keep_last=3):
-    n = norm_name(name)
-    toks = [t for t in n.split() if t and t not in STOP_WORDS]
-    suffixes = []
-    while toks and toks[-1] in SURNAME_SUFFIXES:
-        suffixes.append(toks.pop())
-    base = [t for t in toks[-keep_last:] if t not in GENERIC_GIVENS]
-    # NOVO: normaliza grafias equivalentes
-    base = [SURNAME_EQUIV.get(t, t) for t in base]
-    return base, suffixes
+# ------------------------------------------------------------
+# PARSE DE TRIANGULAÇÃO (COM PESOS)
+# ------------------------------------------------------------
+def parse_triang_csv(path):
+    try:
+        df = pd.read_csv(path, encoding='utf-8', skipinitialspace=True)
+    except:
+        df = pd.read_csv(path, encoding='latin-1', skipinitialspace=True)
+    df.columns = [c.strip() for c in df.columns]
+    a_col = next((c for c in df.columns if any(k in c.lower() for k in ("match a","match1","name a","person a","kit1 name"))), None)
+    b_col = next((c for c in df.columns if any(k in c.lower() for k in ("match b","match2","name b","person b","kit2 name"))), None)
+    chr_col = next((c for c in df.columns if c.lower() in ("chr","chrom","chromosome")), None)
+    cm_col   = next((c for c in df.columns if "cm" in c.lower()), None)
+    if not (a_col and b_col and chr_col and cm_col):
+        print("[AVISO] Colunas de Triangulação (A, B, Chr, cM) não encontradas. Pulando arquivo.")
+        return {}
+    tri_with_cm = {}
+    for _, r in df.iterrows():
+        a = norm_name(str(r[a_col]))
+        b = norm_name(str(r[b_col]))
+        try:
+            chr_val = str(r[chr_col]).strip().upper()
+            chrn = int(chr_val.replace("X", "23"))
+        except: continue
+        try:
+            cm = float(r[cm_col])
+        except: cm = 0.0
+        if not a or not b or a == b or cm < 7.0: continue
+        if a > b: a, b = b, a
+        tkey = (a, b, chrn)
+        tri_with_cm[tkey] = max(tri_with_cm.get(tkey, 0.0), cm)
+    print(f"[DEBUG] 'parse_triang_csv' finalizou. Pares ponderados lidos: {len(tri_with_cm)}")
+    return tri_with_cm
 
-def split_name_pt(s: str):
-    n = norm_name(s)
-    toks = [t for t in n.split() if t]
-    given = next((t for t in toks if t not in STOP_WORDS and t not in GENERIC_GIVENS), toks[0] if toks else "")
-    base, suffixes = surname_core_tokens(s, keep_last=3)
-    surnames = [t for t in base if t != given and t not in GENERIC_GIVENS]
-    return given, surnames, set(suffixes)
+# ------------------------------------------------------------
+# OVERLAP
+# ------------------------------------------------------------
+def overlap(seg1, seg2, min_cm=7.0):
+    if seg1["chr"] != seg2["chr"]: return False
+    if seg1["end"] < seg2["start"] or seg2["end"] < seg1["start"]: return False
+    return seg1["cm"] >= min_cm and seg2["cm"] >= min_cm
 
-def surnames_set(name: str):
-    _, surnames, _ = split_name_pt(name)
-    return set(surnames)
+# ------------------------------------------------------------
+# CONSTRUIR GRAFO (COM PESOS)
+# ------------------------------------------------------------
+def build_side_graph(match_names, segs_by, tri_pairs_with_cm=None):
+    tri_pairs_with_cm = tri_pairs_with_cm or {}
+    tri_pairs_provided = len(tri_pairs_with_cm) > 0
+    
+    mset = {norm_name(n) for n in match_names}
+    by_chr = {}
+    for name, segs in segs_by.items():
+        nn = norm_name(name)
+        if nn not in mset: continue
+        for s in segs:
+            by_chr.setdefault(s["chr"], {}).setdefault(nn, []).append(s)
+            
+    out = {}
+    
+    for chrn, mp in by_chr.items():
+        same_weighted = {}
+        opp  = set()
+        names = sorted(mp.keys())
+        
+        for i in range(len(names)):
+            for j in range(i+1, len(names)):
+                a, b = names[i], names[j]
+                
+                has_overlap = False
+                for sa in mp[a]:
+                    for sb in mp[b]:
+                        if overlap(sa, sb):
+                            has_overlap = True
+                if not has_overlap: continue
+                
+                tkey_chr = (a,b,chrn) if a<b else (b,a,chrn)
+                tkey = (a,b) if a<b else (b,a)
 
-
-def top_given_tokens(name: str, k=2):
-    """retorna até k primeiros tokens 'não-stop' para comparar como possíveis 'given'."""
-    n = norm_name(name)
-    toks = [t for t in n.split() if t not in STOP_WORDS]
-    return toks[:k] or n.split()[:k]
-
-
-def token_prefixes(tokens, min_len=3):
-    """gera prefixos (para lidar com 'Oliv', 'Azev', 'GouvA�..')"""
-    out = set()
-    for t in tokens:
-        t = norm_name(t)
-        if len(t) >= min_len:
-            out.add(t[:min_len])
+                # --- LÓGICA CORRIGIDA ---
+                if tri_pairs_provided:
+                    # Se temos triangulação, SÓ usamos links triangulados.
+                    if tkey_chr in tri_pairs_with_cm:
+                        cm_weight = tri_pairs_with_cm[tkey_chr]
+                        # Acumula o peso (soma do QUADRADO dos cMs)
+                        same_weighted[tkey] = same_weighted.get(tkey, 0.0) + (cm_weight * cm_weight)
+                    
+                    # O 'else' (de peso 1.0) FOI REMOVIDO para não poluir o grafo.
+                
+                else:
+                    # Se NÃO temos triangulação, usamos o overlap como link (peso 1.0)
+                    same_weighted[tkey] = same_weighted.get(tkey, 0.0) + 1.0
+        
+        if same_weighted or opp:
+            out[chrn] = {"same": same_weighted, "opp": opp}
+            
     return out
 
-def demojibake(s: str) -> str:
-    if not s:
-        return s
-    # só tenta se aparecerem padrões típicos
-    if any(p in s for p in ("Ã", "Â", "A�", "�")):
-        try:
-            fixed = s.encode("latin1").decode("utf-8")
-            # mantém apenas se “melhorou”
-            if "�" not in fixed and "Ã" not in fixed and "A�" not in fixed:
-                return fixed
-        except Exception:
-            pass
-    return s
-
-def soft_prefix_jaccard(a: set[str], b: set[str], min_pref=4, min_len=2) -> float:
-    # filtra tokens curtíssimos (iniciais)
-    a = {t for t in a if len(t) >= min_len}
-    b = {t for t in b if len(t) >= min_len}
-    if not a and not b:
-        return 0.0
-    a_short = any(len(t) <= min_pref or t.endswith(".") for t in a)
-    b_short = any(len(t) <= min_pref or t.endswith(".") for t in b)
-    if a_short or b_short:
-        def prefset(S): return {t if len(t) <= min_pref else t[:min_pref] for t in S}
-        ap, bp = prefset(a), prefset(b)
-        inter = len(ap & bp); union = len(ap | bp) or 1
-        return inter / union
-    inter = len(a & b); union = len(a | b) or 1
-    return inter / union
-
-
-
-def get_relationships_by_cm(cm_value):
-    if not isinstance(cm_value, (int, float)) or cm_value <= 0:
-        return []
-    poss = [item["relationship"] for item in SHARED_CM_DATA if item["range"][0] <= cm_value <= item["range"][1]]
-    return poss if poss else ["Relação distante ou indeterminada"]
-
-def load_gedcom_and_build_graph(file_path):
-    global people, families, graph, child_to_family
-    with GedcomReader(file_path) as parser:
-        people   = {ref_id(i.xref_id): i for i in parser.records0("INDI")}
-        families = {ref_id(f.xref_id): f for f in parser.records0("FAM")}
-        graph, child_to_family = build_graph_from_parser(people, parser)
-        all_names = sorted([get_name(p) for p in people.values()])
-        return all_names
-
-def build_graph_from_parser(people_dict, parser):
-    g = nx.Graph()
-    c2f = {}
-    for pid, person in people_dict.items():
-        g.add_node(pid, label=get_name(person), type='person')
-    for fam in parser.records0("FAM"):
-        fam_id = ref_id(fam.xref_id)
-        if not fam_id: continue
-        g.add_node(fam_id, label='Familia', type='family')
-        husband_id, wife_id = None, None
-        child_ids = []
-        for sub_rec in fam.sub_records:
-            if sub_rec.tag == "HUSB": husband_id = ref_id(sub_rec.value)
-            elif sub_rec.tag == "WIFE": wife_id = ref_id(sub_rec.value)
-            elif sub_rec.tag == "CHIL":
-                cid = ref_id(sub_rec.value)
-                child_ids.append(cid)
-                c2f.setdefault(cid, []).append(fam_id)
-        if husband_id and g.has_node(husband_id): g.add_edge(husband_id, fam_id)
-        if wife_id and g.has_node(wife_id): g.add_edge(wife_id, fam_id)
-        for cid in child_ids:
-            if g.has_node(cid): g.add_edge(cid, fam_id)
-    return g, c2f
-
-def find_person_by_name(name_query):
-    exact = [pid for pid, p in people.items() if name_query.lower() == get_name(p).lower()]
-    if exact: return exact
-    return [pid for pid, p in people.items() if name_query.lower() in get_name(p).lower()]
-
-def get_parents(person_id):
-    person = people.get(person_id)
-    if not person: return []
-    famc_ref = next((ref_id(rec.value) for rec in person.sub_records if rec.tag == "FAMC"), None)
-    fam_ids = [famc_ref] if famc_ref else child_to_family.get(person_id, [])
-    if not fam_ids: return []
-    parent_ids = []
-    for fam_id in fam_ids:
-        family = families.get(fam_id)
-        if not family: continue
-        for sub_rec in family.sub_records:
-            if sub_rec.tag in ("HUSB", "WIFE"):
-                pid = ref_id(sub_rec.value)
-                if pid and pid not in parent_ids:
-                    parent_ids.append(pid)
-    return parent_ids
-
-def get_spouses(person_id):
-    person = people.get(person_id)
-    spouse_ids = []
-    if person:
-        fams_refs = [ref_id(rec.value) for rec in person.sub_records if rec.tag == "FAMS"]
-        for fam_ref in fams_refs:
-            family = families.get(fam_ref)
-            if not family: continue
-            is_husband = any(ref_id(rec.value) == person_id for rec in family.sub_records if rec.tag == "HUSB")
-            partner_tag = "WIFE" if is_husband else "HUSB"
-            for rec in family.sub_records:
-                if rec.tag == partner_tag:
-                    spouse_ids.append(ref_id(rec.value))
-    if spouse_ids: return spouse_ids
-    for fam in families.values():
-        husb = next((ref_id(r.value) for r in fam.sub_records if r.tag == "HUSB"), None)
-        wife = next((ref_id(r.value) for r in fam.sub_records if r.tag == "WIFE"), None)
-        if husb == person_id and wife: spouse_ids.append(wife)
-        elif wife == person_id and husb: spouse_ids.append(husb)
-    return spouse_ids
-
-def are_spouses(a_id, b_id) -> bool:
-    return b_id in set(get_spouses(a_id))
-
-def split_path_by_marriage(person_path):
-    """Encontra o 1º par de cônjuges adjacentes no caminho indireto."""
-    for i in range(len(person_path) - 1):
-        a, b = person_path[i], person_path[i+1]
-        if are_spouses(a, b):
-            left  = person_path[:i+1]      # ... → A
-            right = person_path[i+1:]      # B → ...
-            return left, right, (a, b)
-    return None, None, None
-
-def pick_spouse_for_couple(person_id, candidate_path=None):
-    """Escolhe um cônjuge para formar o 'casal' no topo do ramo.
-       Se algum cônjuge aparece no path, prioriza; senão, pega o primeiro."""
-    spouses = get_spouses(person_id) or []
-    if candidate_path:
-        seen = set(candidate_path)
-        for s in spouses:
-            if s in seen:
-                return s
-    return spouses[0] if spouses else None
-
-def exclude_tail(seq, n=1):
-    """Retorna seq sem os últimos n elementos (evita duplicar o ancestral na ponta)."""
-    return seq[:-n] if len(seq) > n else []
-
-
-
-def find_indirect_path(start_id, end_id, max_hops=40):
-    """Procura QUALQUER caminho no grafo pessoa↔família (inclui cônjuges/irmãos/descendências).
-       Retorna apenas os nós de pessoa, comprimindo os nós de família."""
-    if graph is None or start_id not in graph or end_id not in graph:
-        return None
-    try:
-        path = nx.shortest_path(graph, source=start_id, target=end_id)  # BFS não ponderado
-        if len(path) - 1 > max_hops:
-            return None
-        # comprime para somente pessoas (remove nós de família)
-        person_path = [n for n in path if n in people]
-        return person_path if len(person_path) >= 2 else None
-    except (nx.NetworkXNoPath, nx.NodeNotFound):
-        return None
-
-
-def find_ancestral_path(start_id, end_id, max_depth=20):
-    q1, q2 = deque([(start_id, [start_id])]), deque([(end_id, [end_id])])
-    visited1, visited2 = {start_id: [start_id]}, {end_id: [end_id]}
-    if start_id == end_id: return ([start_id], start_id)
-    for _depth in range(max_depth):
-        q_size = len(q1)
-        if not q_size: break
-        for _ in range(q_size):
-            curr_id, path = q1.popleft()
-            if curr_id in visited2: return (path + visited2[curr_id][::-1][1:], curr_id)
-            for p_id in get_parents(curr_id):
-                if p_id not in visited1:
-                    new_path = path + [p_id]; visited1[p_id] = new_path; q1.append((p_id, new_path))
-        q_size = len(q2)
-        if not q_size: break
-        for _ in range(q_size):
-            curr_id, path = q2.popleft()
-            if curr_id in visited1: return (visited1[curr_id] + path[::-1][1:], curr_id)
-            for p_id in get_parents(curr_id):
-                if p_id not in visited2:
-                    new_path = path + [p_id]; visited2[p_id] = new_path; q2.append((p_id, new_path))
-    return (None, None)
-
-def generate_mermaid_graph(path, p1_id, p2_id, common_ancestor_id):
-    import re
-    def sid(raw: str) -> str:
-        safe_str = str(raw).replace('@', '').replace('+', '_')
-        return 'N_' + re.sub(r'[^a-zA-Z0-9_]', '', safe_str)
-    def lab(txt: str) -> str:
-        s = unicodedata.normalize("NFC", str(txt))
-        s = (s.replace('\u00A0', ' ')
-               .replace('\u2013', '-')
-               .replace('\u2014', '-')
-               .replace('“','"').replace('”','"').replace('’', "'"))
-        s = (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
-        s = s.replace('"', "'")
-        s = re.sub(r'[\r\n]+', ' ', s)
-        return s
-
-    lines = ["flowchart BT"]; seen_nodes = set()
-    ac_idx = -1
-    if common_ancestor_id and common_ancestor_id in path:
-        try: ac_idx = path.index(common_ancestor_id)
-        except ValueError: pass
-    is_direct_ancestry = (ac_idx == -1 or ac_idx == 0 or ac_idx == len(path) - 1)
-    couple_members_to_skip = set()
-    ancestor_id_for_arrows = sid(common_ancestor_id)
-    if not is_direct_ancestry:
-        spouses = get_spouses(common_ancestor_id)
-        if spouses:
-            couple_members_to_skip.update({common_ancestor_id, spouses[0]})
-            couple_id_str = "+".join(sorted(list(couple_members_to_skip)))
-            ancestor_id_for_arrows = sid(couple_id_str)
-            ac_name1 = lab(get_name(people[common_ancestor_id]))
-            ac_name2 = lab(get_name(people[spouses[0]]))
-            lines.append(f'{ancestor_id_for_arrows}["{ac_name1} &amp; {ac_name2}"]')
-            seen_nodes.add(ancestor_id_for_arrows)
-    for node_id in path:
-        if node_id in couple_members_to_skip: continue
-        node_sid = sid(node_id)
-        if node_sid not in seen_nodes:
-            node_name = lab(get_name(people.get(node_id)))
-            lines.append(f'{node_sid}["{node_name}"]')
-            seen_nodes.add(node_sid)
-    if is_direct_ancestry:
-        for i in range(len(path) - 1):
-            lines.append(f'{sid(path[i])} --> {sid(path[i+1])}')
-    elif ac_idx > 0:
-        for i in range(ac_idx - 1):
-            lines.append(f'{sid(path[i])} --> {sid(path[i+1])}')
-        lines.append(f'{sid(path[ac_idx - 1])} --> {ancestor_id_for_arrows}')
-        for i in range(len(path) - 1, ac_idx + 1, -1):
-            lines.append(f'{sid(path[i])} --> {sid(path[i-1])}')
-        lines.append(f'{sid(path[ac_idx + 1])} --> {ancestor_id_for_arrows}')
-    lines.append(f'style {sid(p1_id)} fill:#e8f5e9,stroke:#66bb6a,stroke-width:2px')
-    lines.append(f'style {sid(p2_id)} fill:#ffebee,stroke:#ef5350,stroke-width:2px')
-    if common_ancestor_id:
-        lines.append(f'style {ancestor_id_for_arrows} fill:#fff9c4,stroke:#fbc02d,stroke-width:2px')
-    return "\n".join(lines)
-
-def generate_mermaid_graph_indirect_bridge(p1_id, p2_id, person_path):
-    import re
-
-    def sid(raw: str) -> str:
-        if isinstance(raw, (list, tuple, set)):
-            raw = next(iter(raw), "")
-        safe_str = str(raw).replace('@', '').replace('+', '_')
-        return 'N_' + re.sub(r'[^a-zA-Z0-9_]', '', safe_str)
-
-    def lab(txt: str) -> str:
-        s = unicodedata.normalize("NFC", str(txt))
-        s = (s.replace('\u00A0', ' ')
-               .replace('\u2013', '-').replace('\u2014', '-')
-               .replace('“','"').replace('”','"').replace('’', "'"))
-        s = (s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
-        s = s.replace('"', "'")
-        s = re.sub(r'[\r\n]+', ' ', s)
-        return s
-
-    def norm_ids(seq):
-        out = []
-        if not seq: return out
-        for x in seq:
-            if isinstance(x, (list, tuple, set)):
-                out.extend([str(y) for y in x])
-            else:
-                out.append(str(x))
-        return out
-
-    left, right, spouses = split_path_by_marriage(person_path)
-    if not spouses:
-        return generate_mermaid_graph(person_path, p1_id, p2_id, None)
-
-    A, B = map(str, spouses)
-    p1_id, p2_id = str(p1_id), str(p2_id)
-
-    # --- CORREÇÃO IMPORTANTE: Detecta se a ligação é direta ao cônjuge ---
-    is_direct_connection_to_p2 = (p2_id == B)
-
-    # --- Lógica do Ramo 1 (ESQ) ---
-    path_p1_A, ca1 = find_ancestral_path(p1_id, A)
-    if not path_p1_A:
-        return generate_mermaid_graph(person_path, p1_id, p2_id, None)
+# ------------------------------------------------------------
+# FUNÇÃO AUXILIAR PARA CONSTRUIR ÁRVORE (MODO HIERÁRQUICO - CORRIGIDO)
+# ------------------------------------------------------------
+def build_tree_json(phased_groups, kept, G, use_weight=True, user_resolution=1.0):
+    tree = {"nodes": [], "edges": []}
+    table_groups = [] # <-- NOVO: Lista para a tabela
     
-    spouse_ca1 = pick_spouse_for_couple(ca1, candidate_path=path_p1_A)
+    # Define o parâmetro de peso para o Louvain
+    louvain_weight = 'weight' if use_weight else None
     
-    def split_at(path, mid):
-        path = norm_ids(path); mid = str(mid)
-        i = path.index(mid)
-        down = path[:i+1]
-        up_rev = list(reversed(path[i:]))
-        return down, up_rev
-
-    r1_down, r1_up_from_A = split_at(path_p1_A, ca1)
-
-    couple1_id = None
-    if spouse_ca1:
-        couple1_id = sid("+".join(sorted([str(ca1), str(spouse_ca1)])))
-        couple1_label = f'{lab(get_name(people.get(ca1)))} &amp; {lab(get_name(people.get(spouse_ca1)))}'
+    colors = ["#F44336", "#2196F3", "#4CAF50", "#FFC107", "#9C27B0", "#00BCD4"]
+    tree["nodes"].append({"id": "root", "label": "Você", "side": None})
     
-    lines = ["flowchart BT"]; seen = set()
-    def add_node(pid, label=None):
-        pid = str(pid); node = sid(pid)
-        if node not in seen:
-            lines.append(f'{node}["{lab(get_name(people.get(pid))) if label is None else label}"]')
-            seen.add(node)
-        return node
-
-    def add_chain(seq):
-        seq = norm_ids(seq)
-        for i in range(len(seq)):
-            add_node(seq[i])
-            if i < len(seq)-1:
-                lines.append(f'{sid(seq[i])} --> {sid(seq[i+1])}')
-
-    lines.append("subgraph COLUMNS"); lines.append("direction BT")
-    lines.append("subgraph ESQ[Ramo 1]"); lines.append("direction BT")
-    lines.append("subgraph ESQ_COLS"); lines.append("direction BT")
-
-    left_col_r1  = exclude_tail(r1_down, n=1)
-    right_col_r1 = exclude_tail(r1_up_from_A, n=1)
-
-    if left_col_r1:
-        lines.append("subgraph ESQ_L[ ]"); lines.append("direction BT")
-        add_chain(left_col_r1)
-        lines.append("end")
-
-    if right_col_r1:
-        lines.append("subgraph ESQ_R[ ]"); lines.append("direction BT")
-        add_chain(right_col_r1)
-        lines.append("end")
-
-    lines.append("end") # ESQ_COLS
+    main_branches = [
+        ("paternal", "Lado Paterno", 1), # Azul
+        ("maternal", "Lado Materno", 0), # Vermelho
+        ("both", "Ambos os Lados", 2), # Verde
+        ("unknown", "Desconhecido", 3)  # Amarelo
+    ]
     
-    if couple1_id:
-        lines.append(f'{couple1_id}["{couple1_label}"]')
-        if left_col_r1: lines.append(f'{sid(left_col_r1[-1])} --> {couple1_id}')
-        if right_col_r1: lines.append(f'{sid(right_col_r1[-1])} --> {couple1_id}')
-    else:
-        add_node(ca1)
-        if left_col_r1: lines.append(f'{sid(left_col_r1[-1])} --> {sid(ca1)}')
-        if right_col_r1: lines.append(f'{sid(right_col_r1[-1])} --> {sid(ca1)}')
-
-    lines.append("end") # ESQ
-
-    # --- CORREÇÃO IMPORTANTE: Lógica condicional para o Ramo 2 ---
-    if is_direct_connection_to_p2:
-        lines.append("subgraph DIR[Ramo 2]")
-        lines.append("direction BT")
-        add_node(p2_id)
-        lines.append("end")
-        right_col_r2 = [] 
-        couple2_id, ca2 = None, None # Zera variáveis não usadas
-    else:
-        path_p2_B, ca2 = find_ancestral_path(p2_id, B)
-        if not path_p2_B:
-            return generate_mermaid_graph(person_path, p1_id, p2_id, None)
-
-        spouse_ca2 = pick_spouse_for_couple(ca2, candidate_path=path_p2_B)
-        r2_down, r2_up_from_B = split_at(path_p2_B, ca2)
-
-        couple2_id = None
-        if spouse_ca2:
-            couple2_id = sid("+".join(sorted([str(ca2), str(spouse_ca2)])))
-            couple2_label = f'{lab(get_name(people.get(ca2)))} &amp; {lab(get_name(people.get(spouse_ca2)))}'
+    # --- MODO FALLBACK ---
+    if phased_groups is None:
+        # ------------------------------------------------------------
+        # CORREÇÃO: Criar uma cópia e remover isolados ANTES de clusterizar
+        # ------------------------------------------------------------
+        G_sub_limpo = G.copy() # Criar cópia para não modificar o 'G' original
+        nodes_isolados = list(nx.isolates(G_sub_limpo))
+        if nodes_isolados:
+            G_sub_limpo.remove_nodes_from(nodes_isolados)
+            print(f"[INFO] build_tree (Fallback): Removendo {len(nodes_isolados)} isolados.")
+        # ------------------------------------------------------------
         
-        lines.append("subgraph DIR[Ramo 2]"); lines.append("direction BT")
-        lines.append("subgraph DIR_COLS"); lines.append("direction BT")
+        G_sub = G_sub_limpo # Usar o grafo limpo
+        subramos = list(greedy_modularity_communities(G_sub, resolution=0.5, weight=louvain_weight))
+        
+        if not subramos and list(G_sub.nodes()): # Fallback
+            subramos = [set(G_sub.nodes())]
 
-        left_col_r2  = exclude_tail(r2_up_from_B, n=1)
-        right_col_r2 = exclude_tail(r2_down, n=1)
+        for i, subramo_nodes in enumerate(subramos):
+            subramo_id = f"subramo_{i}"
+            subramo_cor = i % len(colors)
+            subramo_label = f"Subramo {i}"
+            
+            tree["nodes"].append({"id": subramo_id, "label": subramo_label, "side": subramo_cor})
+            tree["edges"].append({"from": "root", "to": subramo_id})
 
-        if left_col_r2:
-            lines.append("subgraph DIR_L[ ]"); lines.append("direction BT")
-            add_chain(left_col_r2)
-            lines.append("end")
+            # 2. Encontrar Ramos
+            G_ramo = G_sub.subgraph(subramo_nodes)
+            ramos = list(greedy_modularity_communities(G_ramo, resolution=user_resolution, weight=louvain_weight))
 
-        if right_col_r2:
-            lines.append("subgraph DIR_R[ ]"); lines.append("direction BT")
-            add_chain(right_col_r2)
-            lines.append("end")
+            if not ramos and list(G_ramo.nodes()): # Fallback
+                 ramos = [set(G_ramo.nodes())]
+            
+            if len(ramos) == 1:
+                ramo_nodes = list(ramos)[0]
+                ramo_id_para_link = subramo_id
+                ramo_label = subramo_label # O nome do grupo é o do Subramo
+                ramo_nodes_flat = True
+            else:
+                ramo_nodes = None
+                ramo_nodes_flat = False
 
-        lines.append("end") # DIR_COLS
+            for j, ramo_nodes_loop in enumerate(ramos):
+                current_matches = [] # <-- NOVO: Lista de matches para este grupo
+                
+                if not ramo_nodes_flat:
+                    ramo_nodes_inner = ramo_nodes_loop
+                    ramo_id = f"ramo_{i}_{j}"
+                    ramo_label = f"Ramo {i}-{j}" # Nome do grupo é o Ramo
+                    tree["nodes"].append({"id": ramo_id, "label": ramo_label, "side": subramo_cor})
+                    tree["edges"].append({"from": subramo_id, "to": ramo_id})
+                    ramo_id_para_link = ramo_id
+                else:
+                    ramo_nodes_inner = ramo_nodes
+                
+                for member in ramo_nodes_inner:
+                    if member not in kept: continue
+                    orig_name, cmval = kept[member]
+                    tree["nodes"].append({
+                        "id": member,
+                        "label": f"{orig_name} ({cmval:.1f} cM)",
+                        "side": subramo_cor,
+                        "cm": cmval
+                    })
+                    tree["edges"].append({"from": ramo_id_para_link, "to": member})
+                    current_matches.append({"name": orig_name, "cm": cmval}) # <-- NOVO
+                
+                # Adiciona o grupo e seus matches à tabela
+                if current_matches:
+                    table_groups.append({"group_name": ramo_label, "matches": current_matches})
 
-        if couple2_id:
-            lines.append(f'{couple2_id}["{couple2_label}"]')
-            if left_col_r2: lines.append(f'{sid(left_col_r2[-1])} --> {couple2_id}')
-            if right_col_r2: lines.append(f'{sid(right_col_r2[-1])} --> {couple2_id}')
-        else:
-            add_node(ca2)
-            if left_col_r2: lines.append(f'{sid(left_col_r2[-1])} --> {sid(ca2)}')
-            if right_col_r2: lines.append(f'{sid(right_col_r2[-1])} --> {sid(ca2)}')
+                if ramo_nodes_flat:
+                    break
+        
+        return tree, table_groups # <-- MUDANÇA: Retorna a tabela
 
-        lines.append("end") # DIR
+    # --- MODO PHASED ---
+    for group_key, group_label, group_color_index in main_branches:
+        
+        group_nodes = phased_groups[group_key]
+        if not group_nodes: continue
+        
+        branch_id = f"branch_{group_key}"
+        link_from = "root"
+        
+        tree["nodes"].append({"id": branch_id, "label": group_label, "side": group_color_index})
+        tree["edges"].append({"from": link_from, "to": branch_id})
+        link_from = branch_id
 
-    # --- Ponte de Casamento e Estilos ---
-    A_anchor = sid(f"{A}_anc"); B_anchor = sid(f"{B}_anc")
-    lines += [f'{A_anchor}[" "]', f'{B_anchor}[" "]', f'style {A_anchor} fill:transparent,stroke:transparent,stroke-width:0', f'style {B_anchor} fill:transparent,stroke:transparent,stroke-width:0', f'{sid(A)} --- {A_anchor}', f'{B_anchor} --- {sid(B)}', f'{A_anchor} --- |Casamento| {B_anchor}']
-    lines.append("end") # COLUMNS
+        # ------------------------------------------------------------
+        # CORREÇÃO: Criar um subgrafo-cópia e remover isolados ANTES
+        # ------------------------------------------------------------
+        # Criamos uma CÓPIA do subgrafo, não uma view, para poder modificá-lo
+        G_sub_limpo = G.subgraph(group_nodes).copy() 
+        
+        nodes_isolados_no_subgrafo = list(nx.isolates(G_sub_limpo))
+        if nodes_isolados_no_subgrafo:
+            G_sub_limpo.remove_nodes_from(nodes_isolados_no_subgrafo)
+            print(f"[INFO] build_tree ({group_key}): Removendo {len(nodes_isolados_no_subgrafo)} isolados.")
+        # ------------------------------------------------------------
 
-    # --- CORREÇÃO IMPORTANTE: Lógica de estilo ajustada ---
-    if left_col_r1:
-        lines.append(f'style {sid(p1_id)} fill:#e8f5e9,stroke:#66bb6a,stroke-width:2px')
-    
-    if is_direct_connection_to_p2 or right_col_r2:
-        lines.append(f'style {sid(p2_id)} fill:#ffebee,stroke:#ef5350,stroke-width:2px')
+        G_sub = G_sub_limpo # Usar o grafo limpo
+        subramos = list(greedy_modularity_communities(G_sub, resolution=0.5, weight=louvain_weight))
+        
+        if not subramos and list(G_sub.nodes()):
+            subramos = [set(G_sub.nodes())]
 
-    if couple1_id: lines.append(f'style {couple1_id} fill:#fff9c4,stroke:#fbc02d,stroke-width:2px')
-    elif ca1:      lines.append(f'style {sid(ca1)} fill:#fff9c4,stroke:#fbc02d,stroke-width:2px')
+        for i, subramo_nodes in enumerate(subramos):
+            
+            subramo_id = f"subramo_{group_key}_{i}"
+            subramo_label = f"{group_label} - Subramo {i}"
+            tree["nodes"].append({"id": subramo_id, "label": f"Subramo {i}", "side": group_color_index})
+            tree["edges"].append({"from": link_from, "to": subramo_id})
 
-    if couple2_id: lines.append(f'style {couple2_id} fill:#fff9c4,stroke:#fbc02d,stroke-width:2px')
-    elif ca2:      lines.append(f'style {sid(ca2)} fill:#fff9c4,stroke:#fbc02d,stroke-width:2px')
+            G_ramo = G_sub.subgraph(subramo_nodes)
+            ramos = list(greedy_modularity_communities(G_ramo, resolution=user_resolution, weight=louvain_weight))
 
-    lines.append(f'style {sid(A)} fill:#fff8e1,stroke:#f6a821,stroke-width:2px')
-    lines.append(f'style {sid(B)} fill:#fff8e1,stroke:#f6a821,stroke-width:2px')
+            if not ramos and list(G_ramo.nodes()):
+                 ramos = [set(G_ramo.nodes())]
+            
+            if len(ramos) == 1:
+                ramo_nodes = list(ramos)[0]
+                ramo_id_para_link = subramo_id
+                ramo_label = subramo_label # Nome do grupo é o Subramo
+                ramo_nodes_flat = True
+            else:
+                ramo_nodes = None
+                ramo_nodes_flat = False
 
-    return "\n".join(lines)
+            for j, ramo_nodes_loop in enumerate(ramos):
+                current_matches = [] # <-- NOVO
+                
+                if not ramo_nodes_flat:
+                    ramo_nodes_inner = ramo_nodes_loop
+                    ramo_id = f"ramo_{group_key}_{i}_{j}"
+                    ramo_label = f"{subramo_label} - Ramo {j}" # Nome do grupo
+                    tree["nodes"].append({"id": ramo_id, "label": f"Ramo {i}-{j}", "side": group_color_index})
+                    tree["edges"].append({"from": subramo_id, "to": ramo_id})
+                    ramo_id_para_link = ramo_id
+                else:
+                    ramo_nodes_inner = ramo_nodes
+                
+                for member in ramo_nodes_inner:
+                    if member not in kept: continue
+                    orig_name, cmval = kept[member]
+                    tree["nodes"].append({
+                        "id": member,
+                        "label": f"{orig_name} ({cmval:.1f} cM)",
+                        "side": group_color_index,
+                        "cm": cmval
+                    })
+                    tree["edges"].append({"from": ramo_id_para_link, "to": member})
+                    current_matches.append({"name": orig_name, "cm": cmval}) # <-- NOVO
+                
+                if current_matches:
+                    table_groups.append({"group_name": ramo_label, "matches": current_matches})
 
-
-
-# --- Rota Principal ---
-@app.route("/", methods=["GET", "POST"])
+                if ramo_nodes_flat:
+                    break
+        
+    return tree, table_groups
+# ------------------------------------------------------------
+# ROTA PRINCIPAL
+# ------------------------------------------------------------
+@app.route("/", methods=["GET","POST"])
 def index():
     if request.method == "POST":
-        action = request.form.get("action")
-        if action == "upload_gedcom":
-            if "gedcom" not in request.files:
-                return render_template("index.html", message="Nenhum arquivo GEDCOM enviado.", success=False)
-            gedcom_file = request.files["gedcom"]
-            if gedcom_file.filename == '':
-                return render_template("index.html", message="Nenhum arquivo selecionado.", success=False)
-            try:
-                gedcom_path = os.path.join(UPLOAD_FOLDER, gedcom_file.filename)
-                gedcom_file.save(gedcom_path)
-                all_names = load_gedcom_and_build_graph(gedcom_path)
-                return render_template("index.html", gedcom_filename=gedcom_file.filename, all_names=all_names, message=f"Arquivo '{gedcom_file.filename}' carregado!", success=True)
-            except Exception as e:
-                return render_template("index.html", message=f"Erro ao processar GEDCOM: {e}", success=False)
 
-        gedcom_filename = request.form.get("gedcom_filename")
-        if not gedcom_filename:
-            return render_template("index.html", message="Erro: Arquivo GEDCOM não encontrado.", success=False)
-        gedcom_path = os.path.join(UPLOAD_FOLDER, gedcom_filename)
-        if not os.path.exists(gedcom_path):
-            return render_template("index.html", message=f"Erro: Arquivo '{gedcom_filename}' não existe mais.", success=False)
-        all_names = load_gedcom_and_build_graph(gedcom_path)
+        # ===============================
+        # 1) CARREGAR ARQUIVOS
+        # ===============================
+        seg_files_user = request.files.getlist("segment_files")
+        seg_files_pai = request.files.getlist("father_segment_files")
+        seg_files_mae = request.files.getlist("mother_segment_files")
+        tri_files = request.files.getlist("triangulation_csv")
 
-        if action == "dna_analysis":
-            try:
-                if "matches_csv" not in request.files or not request.files["matches_csv"].filename:
-                    return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names, message="Por favor, carregue o arquivo CSV de matches.", success=False)
-                matches_file, root_name = request.files["matches_csv"], request.form["root_name"]
-                matches_path = os.path.join(UPLOAD_FOLDER, matches_file.filename)
-                matches_file.save(matches_path)
+        if not seg_files_user or seg_files_user[0].filename == "":
+            return render_template("index.html", error="Envie ao menos 1 CSV de segmentos do Usuário.")
+        
+        is_phased = (seg_files_pai and seg_files_pai[0].filename != "") and \
+                    (seg_files_mae and seg_files_mae[0].filename != "")
+                    
+        # --- NOVO: Capturar Resolução do Formulário ---
+        try:
+            # Pega o valor do <select>, usa '1.0' como padrão se falhar
+            user_resolution = float(request.form.get("resolution_select", "1.0"))
+        except ValueError:
+            user_resolution = 1.0 # Padrão de segurança
+        print(f"[INFO] Usando Resolução de Ramos: {user_resolution}")
+        # ------------------------------------------------
+
+        # ===============================
+        # 2) PARSEAR SEGMENTOS DO USUÁRIO
+        # ===============================
+        raw_segs = {}
+        for f in seg_files_user:
+            if f.filename == "": continue
+            p = os.path.join(UPLOAD_FOLDER, f.filename)
+            f.save(p)
+            parsed = parse_segments_csv(p)
+            for name, segs in parsed.items():
+                raw_segs.setdefault(name, []).extend(segs)
+
+        # ===============================
+        # 3) PARSEAR TRIANGULAÇÃO (SEMPRE NECESSÁRIO)
+        # ===============================
+        all_tri = {}
+        if tri_files and tri_files[0].filename != "":
+            for f in tri_files:
+                if f.filename == "": continue
+                p = os.path.join(UPLOAD_FOLDER, f.filename)
+                f.save(p)
+                parsed_tri = parse_triang_csv(p)
+                all_tri.update(parsed_tri)
                 
-                root_person_ids = find_person_by_name(root_name)
-                if not root_person_ids:
-                    return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names, message=f"Seu nome '{root_name}' não foi encontrado no GEDCOM.", success=False)
-                root_id = root_person_ids[0]
+        tem_triangulacao = len(all_tri) > 0
+        
+        # ===============================
+        # 4) NORMALIZAR E FILTRAR USUÁRIO
+        # ===============================
+        normalized_segs = {}
+        norm_to_orig = {}
+        for orig_name, segs in raw_segs.items():
+            nn = norm_name(orig_name)
+            if not nn: continue
+            normalized_segs.setdefault(nn, []).extend(segs)
+            if nn not in norm_to_orig:
+                norm_to_orig[nn] = orig_name
+        
+        if not normalized_segs:
+            return render_template("index.html", error="Nenhum segmento válido após normalização.")
 
-                # leitura tolerante
-                try:
-                    dna_matches_df = pd.read_csv(matches_path, encoding='utf-8', skipinitialspace=True)
-                except UnicodeDecodeError:
-                    dna_matches_df = pd.read_csv(matches_path, encoding='latin-1', skipinitialspace=True)
-                
-                dna_matches_df.columns = [col.strip() for col in dna_matches_df.columns]
-                
-                # depois de dna_matches_df.columns = [...]
-                name_col = next((col for col in ['Name','MatchedName','Nome'] if col in dna_matches_df.columns), None)
-                cm_col   = next((col for col in ['cM','TotalCM','Total cM'] if col in dna_matches_df.columns), None)
+        total_cm = {}
+        for norm_name_key, segs in normalized_segs.items():
+            total = sum(s["cm"] for s in segs)
+            total_cm[norm_name_key] = (norm_to_orig.get(norm_name_key, norm_name_key), total)
 
-                # tente achar uma coluna de ID de match (p.ex., "ZH7115669", "NB8637176"...)
-                id_cols_guess = [c for c in dna_matches_df.columns
-                                 if dna_matches_df[c].astype(str).str.fullmatch(r'[A-Z]{2}\d{7}').mean() > 0.3]
-                match_id_col = id_cols_guess[0] if id_cols_guess else None
+        CM_THRESHOLD = 30
+        kept = {n:(orig,cm) for n,(orig,cm) in total_cm.items() if cm >= CM_THRESHOLD}
+        if not kept:
+            return render_template("index.html", error=f"Nenhum match >= {CM_THRESHOLD} cM.")
+        
+        normalized_segs = {n: normalized_segs[n] for n in kept}
+        names = list(normalized_segs.keys())
 
-                email_cols = [c for c in dna_matches_df.columns if 'mail' in c.lower()]
-                match_email_col = email_cols[-1] if email_cols else None  # costuma ser o e-mail do parente
+        # ===============================
+        # 5) CONSTRUIR GRAFO PONDERADO (SEMPRE NECESSÁRIO)
+        # ===============================
+        sg = build_side_graph(names, normalized_segs, all_tri)
+        same_all_weighted = {}
+        nodes = set()
+        for chrn, edges in sg.items():
+            for (a, b), weight in edges["same"].items():
+                if a in kept and b in kept:
+                    same_all_weighted[(a,b)] = same_all_weighted.get((a,b), 0.0) + weight
+                    nodes.add(a); nodes.add(b)
 
-                def build_group_key(row):
-                    parts = [norm_name(demojibake(str(row[name_col])))]
-                    if match_id_col:
-                        parts.append(str(row[match_id_col]).strip().upper())
-                    elif match_email_col:
-                        parts.append(norm_name(str(row[match_email_col])))
-                    return " | ".join(parts)
+        G = nx.Graph()
+        G.add_nodes_from(kept)
+        
+        # Vamos verificar se temos dados de triangulação reais
+        if tem_triangulacao:
+            print("[INFO] Grafo Ponderado (Triangulação) ATIVADO.")
+            for (a, b), weight in same_all_weighted.items():
+                if a in kept and b in kept:
+                    G.add_edge(a, b, weight=weight)
+        else:
+            # Modo Fallback (Sem Triangulação): Grafo não-ponderado
+            print("[INFO] Grafo NÃO Ponderado (Overlap) ATIVADO.")
+            for (a, b) in same_all_weighted.keys(): # Ignora o 'weight=1.0'
+                if a in kept and b in kept:
+                    G.add_edge(a, b) # Adiciona a aresta SEM peso
+        
+               
+        # ===============================
+        # 6) ESCOLHER O MODO E GERAR ÁRVORE
+        # ===============================
+        phased_groups = None
+        tree = {}
+        
+        if is_phased:
+            print("[INFO] Modo Phased Ativado.")
+            matches_do_pai = parse_parent_segment_files(seg_files_pai)
+            matches_da_mae = parse_parent_segment_files(seg_files_mae)
 
-                dna_matches_df["_group_key"] = dna_matches_df.apply(build_group_key, axis=1)
+            # --- ETAPA 6A: Seeds ---
+            initial_groups = {
+                "paternal": set(),
+                "maternal": set(),
+                "both": set(),
+                "unknown": set()
+            }
 
-                aggregated_matches = (
-                    dna_matches_df
-                    .groupby("_group_key", as_index=False)
-                    .agg({cm_col: "sum"})
-                    .merge(
-                        dna_matches_df[["_group_key", name_col]].drop_duplicates("_group_key"),
-                        on="_group_key", how="left"
-                    )
-                )
-
-
-                # Índices
-                ged_index = {}
-                surname_index = {}
-                given_index = {}
-
-                for pid, person in people.items():
-                    nm = get_name(person)
-                    key = norm_name(nm)
-                    ged_index.setdefault(key, []).append(pid)
-                    given, surnames, _ = split_name_pt(nm)
-                    given_index.setdefault(given, []).append(pid)
-                    for sn in surnames:
-                        if sn:
-                            surname_index.setdefault(sn, []).append(pid)
-
-                HARD_MIN = 92
-                GIVEN_MIN = 90
-
-                results_list = []
-                skipped_matches = []  # diagnóstico
-
-                for _, row in aggregated_matches.iterrows():
-                    csv_name_raw = str(row[name_col]).strip()
-                    match_name = demojibake(csv_name_raw)
-                    key = norm_name(match_name)
-
-                    cm_value = row[cm_col]
-
-                    # 1) exact match normalizado
-                    candidate_pids = ged_index.get(key, [])
-
-                    reason = None
-
-                    # 2) restringe por sobrenome(s)
-                    if not candidate_pids:
-                        given_csv, surn_csv, csv_suffixes = split_name_pt(match_name)
-                        given_norm = norm_name(given_csv)
-                        # set normalizado dos sobrenomes do CSV (já com limpeza/acentos)
-                        csv_surn_all = drop_short_tokens(surnames_set(match_name))
-
-                        # monte o pool por sobrenome
-                        pool = set()
-                        for sn in surn_csv:
-                            pool.update(surname_index.get(sn, []))
-
-                        # fallback controlado para abreviações (ex.: 'oliv' ~ 'oliveira', 'azev' ~ 'azevedo')
-                        if not pool and surn_csv:
-                            pref = token_prefixes(surn_csv, min_len=3)
-                            for sn, pids in surname_index.items():
-                                if any(sn.startswith(p) for p in pref):
-                                    pool.update(pids)
-
-                        if not pool:
-                            reason = "sem candidatos por sobrenome (abreviação/corrupção?)"
-                        else:
-                            # 2c) escolha do melhor candidato (por score + interseção)
-                            best_pid = None
-                            best_score = best_g = -1
-                            best_inter = -1
-
-                            key_norm = norm_name(match_name)
-
-                            for pid in pool:
-                                nm = get_name(people[pid])
-
-                                # given: compare com até 2 primeiros tokens “não-stop” do GED
-                                ged_given_candidates = [norm_name(t) for t in top_given_tokens(nm, k=2)]
-                                s_given = max((fuzz.ratio(given_norm, gg) for gg in ged_given_candidates), default=0)
-
-                                s_token = fuzz.token_sort_ratio(key_norm, norm_name(nm))
-                                s_part  = fuzz.partial_ratio(key_norm, norm_name(nm))
-
-                                ged_surn_set = surnames_set(nm)
-                                inter_set = csv_surn_all & ged_surn_set
-                                inter_cnt_local = len(inter_set)
-
-                                # penalização para interseção apenas com sobrenomes super comuns
-                                common_penalty = sum(1 for s in inter_set if s in COMMON_SURNAMES)
-                                inter_bonus = 8.0 * inter_cnt_local - 4.0 * common_penalty
-
-                                score = round(0.55*s_token + 0.25*s_part + 0.20*s_given + inter_bonus, 2)
-
-                                # desempate: mais interseção > maior given > maior score
-                                if (inter_cnt_local > best_inter or
-                                    (inter_cnt_local == best_inter and s_given > best_g) or
-                                    (inter_cnt_local == best_inter and s_given == best_g and score > best_score)):
-                                    best_pid, best_score, best_g, best_inter = pid, score, s_given, inter_cnt_local
-
-                            # 2d) regras de ACEITAÇÃO usando apenas o melhor candidato
-                            if best_pid is not None:
-                                nm_best = get_name(people[best_pid])
-                                ged_surn_best = surnames_set(nm_best)
-                                inter_best = csv_surn_all & ged_surn_best
-                                inter_cnt = len(inter_best)
-
-                                # se ambos têm sobrenomes e não há nenhum em comum, bloquear (a menos de sufixo ‘salvador’)
-                                ged_tokens = set(norm_name(nm_best).split())
-                                suffix_hit = bool(csv_suffixes & ged_tokens)
-                                if csv_surn_all and ged_surn_best and inter_cnt == 0 and not suffix_hit:
-                                    candidate_pids = []
-                                    reason = "sem sobrenome em comum (filtro anti-falso-positivo)"
-                                else:
-                                    # interseção mínima adaptativa
-                                    required_intersection = 1
-                                    if given_norm in GENERIC_GIVENS and len(csv_surn_all) >= 2:
-                                        required_intersection = 2
-
-                                    # Jaccard com prefixo quando CSV está abreviado
-                                    jacc = soft_prefix_jaccard(csv_surn_all, ged_surn_best, min_pref=4)
-                                    jacc_ok = True
-                                    if len(csv_surn_all) >= 2:
-                                        threshold = 0.5
-                                        # leve relaxamento para matches muito altos
-                                        if float(cm_value or 0) >= 150 and given_norm not in GENERIC_GIVENS:
-                                            threshold = 0.33
-                                        jacc_ok = jacc >= threshold
-
-                                    ACCEPT = False
-
-                                    # (A) Dado GENÉRICO, mas sobrenomes muito fortes
-                                    # Ex.: "João Batista Resende Sá": inter>=2, jacc alto, score alto
-                                    if (given_norm in GENERIC_GIVENS and inter_cnt >= 2 and jacc >= 0.67 and best_score >= 100):
-                                        ACCEPT = True
-
-                                    # (B) Dado NÃO-GENÉRICO + 2 sobrenomes fortes
-                                    # Ex.: "Neide Oliveira Azevedo": dado não genérico, inter>=2, jacc>=0.5
-                                    elif (given_norm not in GENERIC_GIVENS and inter_cnt >= 2 and jacc >= 0.50 and best_g >= 85 and best_score >= 80):
-                                        ACCEPT = True
-
-                                    # (C) Dado NÃO-GENÉRICO + 1 sobrenome mas Jaccard MUITO alto (inicial no meio, ex.: "S")
-                                    # Ex.: "Hermano S Albuquerque": inter>=1, jacc>=0.80, score razoável
-                                    elif (given_norm not in GENERIC_GIVENS and inter_cnt >= 1 and jacc >= 0.80 and best_score >= 86):
-                                        ACCEPT = True
-
-                                    # (D) Regras originais
-                                    elif (best_g >= 90 and best_score >= 92 and inter_cnt >= required_intersection and jacc_ok):
-                                        ACCEPT = True
-                                    elif (best_g >= 95 and best_score >= 88 and inter_cnt >= required_intersection and jacc_ok):
-                                        ACCEPT = True
-                                    else:
-                                        # fallback por prefixo (mantém seu bloco atual):
-                                        pref_csv = token_prefixes(surn_csv, min_len=3)
-                                        if pref_csv:
-                                            cand_given, cand_surns, _ = split_name_pt(nm_best)
-                                            if any(sn.startswith(tuple(pref_csv)) for sn in cand_surns) and best_g >= 90 and best_score >= 86 and inter_cnt >= 1 and jacc_ok:
-                                                ACCEPT = True
-
-                                    # endurecimento por "middle" distintivo ausente (mantenha seu bloco existente)
-                                    if ACCEPT:
-                                        csv_tokens = drop_short_tokens({t for t in norm_name(match_name).split() if t not in STOP_WORDS})
-                                        csv_middle = csv_tokens - {given_norm} - csv_surn_all
-                                        if csv_middle and csv_middle.isdisjoint(ged_tokens):
-                                            ACCEPT = (best_score >= 96 and best_g >= 92 and inter_cnt >= required_intersection and jacc_ok)
-
-
-                                    candidate_pids = [best_pid] if ACCEPT else []
-                                    if not candidate_pids:
-                                        reason = (f"score insuficiente ou conflito de sobrenome "
-                                                  f"(given={best_g}, final={best_score}, inter={inter_cnt}/{required_intersection}, jacc={jacc:.2f})")
-
-
-                    if not candidate_pids:
-                        skipped_matches.append({"csv_name": csv_name_raw, "motivo": reason or "não encontrado"})
-                        continue
-
-                    # 3) tenta achar caminho; usa o primeiro que tem caminho
-                    added = False
-                    for pid in candidate_pids:
-                        path, common_ancestor = find_ancestral_path(root_id, pid)
-                        if path:
-                            nomes = [get_name(people[p_id]) for p_id in path]
-                            probable_relationships = get_relationships_by_cm(cm_value)
-                            mermaid_data = generate_mermaid_graph(path, root_id, pid, common_ancestor)
-                            results_list.append({
-                                'match_name': get_name(people[pid]),
-                                'cm': cm_value,
-                                'text_path': " → ".join(nomes),
-                                'mermaid_data': mermaid_data,
-                                'relationships': ", ".join(probable_relationships),
-                                'csv_name': csv_name_raw
-                            })
-                            added = True
-                            break
-                    if not added:
-                        skipped_matches.append({"csv_name": csv_name_raw, "motivo": "sem caminho subindo por pais (pais ausentes no GED?)"})
-
-                results_list_sorted = sorted(results_list, key=lambda x: x.get('cm', 0), reverse=True)
-                # Passa também os descartados para auditoria
-                return render_template(
-                    "index.html",
-                    gedcom_filename=gedcom_filename,
-                    all_names=all_names,
-                    dna_results=results_list_sorted,
-                    skipped_matches=skipped_matches,
-                    message=f"{len(results_list_sorted)} conexões encontradas. {len(skipped_matches)} descartadas.",
-                    success=True
-                )
-            except Exception as e:
-                return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names, message=f"Ocorreu um erro: {e}", success=False)
-
-        if action == "path_search":
-            try:
-                person1_name = request.form["person1_name"].strip()
-                person2_name = request.form["person2_name"].strip()
-
-                p1_ids = find_person_by_name(person1_name)
-                p2_ids = find_person_by_name(person2_name)
-                if not p1_ids:
-                    return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names,
-                                           message=f"Pessoa 1 '{person1_name}' não encontrada.", success=False)
-                if not p2_ids:
-                    return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names,
-                                           message=f"Pessoa 2 '{person2_name}' não encontrada.", success=False)
-
-                # PEGUE APENAS UM ID (string)
-                p1_id, p2_id = p1_ids[0], p2_ids[0]
-
-                # 1) tenta conexão DIRETA (ancestral comum)
-                path, common_ancestor = find_ancestral_path(p1_id, p2_id)
-                if path:
-                    nomes = [get_name(people[n]) for n in path]
-                    mermaid_data = generate_mermaid_graph(path, p1_id, p2_id, common_ancestor)
-                    msg = "Conexão direta encontrada (ancestral comum)."
+            for nn_key in kept.keys():
+                in_pai = nn_key in matches_do_pai
+                in_mae = nn_key in matches_da_mae
+                if in_pai and in_mae:
+                    initial_groups["both"].add(nn_key)
+                elif in_pai:
+                    initial_groups["paternal"].add(nn_key)
+                elif in_mae:
+                    initial_groups["maternal"].add(nn_key)
                 else:
-                    # 2) fallback: conexão INDIRETA (via afinidade)
-                    person_path = find_indirect_path(p1_id, p2_id, max_hops=40)
-                    if not person_path:
-                        return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names,
-                                               message=f"Nenhuma conexão encontrada entre '{person1_name}' e '{person2_name}'.",
-                                               success=True)
-                    nomes = [get_name(people[n]) for n in person_path]
-                    mermaid_data = generate_mermaid_graph_indirect_bridge(p1_id, p2_id, person_path)
-                    msg = "Conexão indireta encontrada (via casamento/afinidade)."
+                    initial_groups["unknown"].add(nn_key)
 
-                path_result = {
-                    "person1_name": person1_name,
-                    "person2_name": person2_name,
-                    "text_path": " → ".join(nomes),
-                    "mermaid_data": mermaid_data,
-                }
-                return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names,
-                                       path_result=path_result, message=msg, success=True)
-            except Exception as e:
-                return render_template("index.html", gedcom_filename=gedcom_filename, all_names=all_names,
-                                       message=f"Ocorreu um erro: {e}", success=False)
+            print(f"[INFO] Phasing (Inicial): {len(initial_groups['paternal'])} Pat / "
+                  f"{len(initial_groups['maternal'])} Mat / "
+                  f"{len(initial_groups['both'])} Ambos / "
+                  f"{len(initial_groups['unknown'])} Desconhecidos")
+
+            # --- ETAPA 6B: Phasing Final ---
+            phased_groups = {
+                "paternal": set(initial_groups["paternal"]),
+                "maternal": set(initial_groups["maternal"]),
+                "both": set(),
+                "unknown": set()
+            }
+
+            matches_to_reclassify = initial_groups["unknown"].union(initial_groups["both"])
+
+            for u_match in matches_to_reclassify:
+                weight_to_pat = 0.0
+                weight_to_mat = 0.0
+
+                if u_match not in G:
+                    phased_groups["unknown"].add(u_match)
+                    continue
+
+                for v_neighbor, edge_data in G[u_match].items():
+                    w = edge_data.get("weight", 0.0)
+                    if v_neighbor in initial_groups["paternal"]:
+                        weight_to_pat += w
+                    elif v_neighbor in initial_groups["maternal"]:
+                        weight_to_mat += w
+
+                if weight_to_pat > weight_to_mat:
+                    phased_groups["paternal"].add(u_match)
+                elif weight_to_mat > weight_to_pat:
+                    phased_groups["maternal"].add(u_match)
+                else:
+                    if u_match in initial_groups["both"]:
+                        phased_groups["both"].add(u_match)
+                    else:
+                        phased_groups["unknown"].add(u_match)
+
+            print(f"[INFO] Phasing (Final): {len(phased_groups['paternal'])} Pat / "
+                  f"{len(phased_groups['maternal'])} Mat / "
+                  f"{len(phased_groups['both'])} Ambos / "
+                  f"{len(phased_groups['unknown'])} Desconhecidos")
+
+            # ------------------------------------------------------------
+            # B2 — REFORÇO ENTRE MEMBROS DO MESMO LADO (AGORA NO LOCAL CERTO)
+            # ------------------------------------------------------------
+            print("[B2] Reforçando conexões internas entre membros do mesmo lado...")
+
+            for lado in ["paternal", "maternal", "both"]:
+                nodes_lado = list(phased_groups[lado])
+                for i in range(len(nodes_lado)):
+                    for j in range(i + 1, len(nodes_lado)):
+                        a = nodes_lado[i]
+                        b = nodes_lado[j]
+                        if a in G and b in G and not G.has_edge(a, b):
+                            G.add_edge(a, b, weight=1.0)
+
+            # ------------------------------------------------------------
+            # B3 — MATCHES FORTES (>50 cM)
+            # ------------------------------------------------------------
+            print("[B3] Aplicando reforço para matches fortes (>50 cM)...")
+
+            cm_por_match = {n: kept[n][1] for n in kept}
+
+            strong = [m for m in cm_por_match if cm_por_match[m] >= 50]
+
+            for i in range(len(strong)):
+                for j in range(i + 1, len(strong)):
+                    a = strong[i]
+                    b = strong[j]
+                    if not G.has_edge(a, b):
+                        G.add_edge(a, b, weight=0.5)
+
+            # ------------------------------------------------------------
+            # Construir árvore já com B2+B3 aplicados
+            # ------------------------------------------------------------
+            tree, table_data = build_tree_json(phased_groups, kept, G, use_weight=tem_triangulacao, user_resolution=user_resolution)
+
+
+        else:
+            # --- MODO FALLBACK (LOUVAIN PONDERADO) ---
+            print("[INFO] Modo Fallback (Louvain Ponderado) Ativado.")
+            
+            # Passamos 'None' para os grupos, e a função irá rodar o Louvain em tudo
+            tree, table_data = build_tree_json(None, kept, G, use_weight=tem_triangulacao, user_resolution=user_resolution)
+
+        # Adiciona nós "fantasmas" para o D3.js (apenas para a paleta de cores funcionar)
+        tree["nodes"].append({"id": "lado_A", "label": "Lado A", "side": 0})
+        tree["nodes"].append({"id": "lado_B", "label": "Lado B", "side": 1})
+
+        return render_template(
+            "resultado.html", 
+            tree_json=json.dumps(tree, ensure_ascii=False),
+            table_data=table_data # <-- ADICIONADO
+        )
 
     return render_template("index.html")
 
+
+# ------------------------------------------------------------
+# RUN
+# ------------------------------------------------------------
 if __name__ == "__main__":
     app.run(debug=True)
