@@ -58,7 +58,7 @@
     // ---------------------------------------------
     const treeLayout = d3
         .tree()
-        .nodeSize([90, 110]); // espaçamento horizontal (x) e vertical (y)
+        .nodeSize([90, 140]); // espaçamento horizontal (x) e vertical (y)
 
     root.x0 = width / 2;
     root.y0 = 0;
@@ -153,13 +153,36 @@
             .attr("stroke", "#333")
             .attr("stroke-width", 1.5);
 
+        // --- CORREÇÃO DE LEITURA: ROTAÇÃO DE TEXTO ---
         nodeEnter.append("text")
-            .attr("dy", -18)
-            .attr("text-anchor", "middle")
-            .attr("font-size", "13px")
+            .attr("font-family", "sans-serif")
+            .attr("font-size", "11px")
             .attr("fill", "#222")
             .text(d => d.data.label)
-            .style("opacity", 0);
+            
+            // LÓGICA DE POSIÇÃO E ROTAÇÃO
+            .attr("transform", d => {
+                // SE FOR MATCH (Folha/Sem filhos):
+                if (!d.children && !d._children) {
+                    // Move 20px para baixo e rotaciona 90 graus
+                    return "translate(0, 20) rotate(90)";
+                }
+                // SE FOR GRUPO (Tem filhos):
+                // Mantém horizontal e move 20px para cima
+                return "translate(0, -20)";
+            })
+            
+            // LÓGICA DE ALINHAMENTO
+            .attr("text-anchor", d => {
+                // Match: "start" faz o texto começar na bolinha e descer
+                if (!d.children && !d._children) return "start"; 
+                // Grupo: "middle" centraliza o texto sobre a bolinha
+                return "middle";
+            })
+
+            .style("opacity", 0)
+            // Sombra branca para leitura
+            .style("text-shadow", "2px 2px 4px white, -2px -2px 4px white, -2px 2px 4px white, 2px -2px 4px white");
 
         // UPDATE
         const nodeUpdate = nodeEnter.merge(node);
