@@ -51,6 +51,14 @@
         .zoom-controls button:first-child {
             margin-bottom: 5px;
         }
+		.pdf-mode .card-body {
+            max-height: none !important; /* Remove a barra de rolagem */
+            overflow: visible !important; /* Mostra todo o conteúdo */
+        }
+        .pdf-mode .card {
+            break-inside: avoid; /* Evita quebrar um card no meio da página */
+            margin-bottom: 20px;
+        }
     </style>
 </head>
 <body>
@@ -95,7 +103,9 @@
                         <span class="title-icon">📊</span>
                         Resumo dos Clusters
                     </h2>
-
+					<button id="btn-pdf" class="btn btn-outline-danger">
+                            Baixar PDF 📄
+                    </button>
                     {% if table_data %}
                         <div class="row">
                             {% for group in table_data %}
@@ -142,6 +152,38 @@
 </script>
 
 <script src="{{ url_for('static', filename='d3_tree.js') }}"></script>
+
+<script>
+    document.getElementById('btn-pdf').addEventListener('click', function() {
+        const element = document.getElementById('clusters-container');
+        const btn = this;
+
+        // 1. Feedback visual
+        const oldText = btn.innerText;
+        btn.innerText = "Gerando PDF...";
+        btn.disabled = true;
+
+        // 2. Aplicar modo PDF (expande as tabelas para não cortar)
+        element.classList.add('pdf-mode');
+
+        // 3. Configurações do PDF
+        const opt = {
+            margin:       10,
+            filename:     'ArboreDNA_Clusters.pdf',
+            image:        { type: 'jpeg', quality: 0.98 },
+            html2canvas:  { scale: 2, useCORS: true },
+            jsPDF:        { unit: 'mm', format: 'a4', orientation: 'portrait' }
+        };
+
+        // 4. Gerar e Salvar
+        html2pdf().set(opt).from(element).save().then(function(){
+            // 5. Restaurar estado original
+            element.classList.remove('pdf-mode');
+            btn.innerText = oldText;
+            btn.disabled = false;
+        });
+    });
+</script>
 
 </body>
 </html>
